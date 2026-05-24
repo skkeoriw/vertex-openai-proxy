@@ -8,8 +8,14 @@ import os
 import time
 import urllib.request
 import urllib.error
+import socket
 from http.server import HTTPServer, BaseHTTPRequestHandler
 from urllib.parse import urlparse
+
+
+class ReusableHTTPServer(HTTPServer):
+    allow_reuse_address = True
+    allow_reuse_port = True
 
 VERTEX_KEY        = os.environ.get("VERTEX_API_KEY", "")
 MODEL             = os.environ.get("GEMINI_MODEL", "gemini-2.5-flash-lite")
@@ -27,11 +33,20 @@ def convert_request(body: dict) -> dict:
     contents  = []
     sys_parts = []
 
+    # 先收集所有消息，把连续 tool 响应合并到同一个 user message
+    # Gemini 要求：同一 assistant turn 的多个 functionCall 必须对应
+    # 同一个 user message 里的多个 functionResponse
+    pending_tool_parts: list = []
+
+    def flush_tool_parts():
+        if pending_tool_parts:
+            contents.append({"role": "user", "parts": list(pending_tool_parts)})
+            pending_tool_parts.clear()
+
     for msg in messages:
         role           = msg.get("role", "user")
         content        = msg.get("content", "")
         tool_calls     = msg.get("tool_calls", [])
-        tool_call_id   = msg.get("tool_call_id")
         parts          = []
 
         if role == "system":
@@ -42,6 +57,18 @@ def convert_request(body: dict) -> dict:
             sys_parts.append({"text": text})
             continue
 
+        # tool 结果回传：合并连续多个到同一 user message
+        if role == "tool":
+            pending_tool_parts.append({"functionResponse": {
+                "name": msg.get("name", "tool"),
+                "response": {"output": content if isinstance(content, str)
+                             else json.dumps(content)},
+            }})
+            continue
+
+        # 非 tool 消息：先把积累的 tool responses flush 出去
+        flush_tool_parts()
+
         # 普通文字内容
         if isinstance(content, str) and content:
             parts.append({"text": content})
@@ -51,7 +78,6 @@ def convert_request(body: dict) -> dict:
                     if c.get("type") == "text":
                         parts.append({"text": c["text"]})
                     elif c.get("type") == "image_url":
-                        # vision 支持（base64）
                         url = c.get("image_url", {}).get("url", "")
                         if url.startswith("data:"):
                             mime, data = url.split(";base64,")
@@ -70,19 +96,12 @@ def convert_request(body: dict) -> dict:
                 "args": args,
             }})
 
-        # tool 结果回传
-        if role == "tool":
-            parts.append({"functionResponse": {
-                "name": msg.get("name", "tool"),
-                "response": {"output": content if isinstance(content, str)
-                             else json.dumps(content)},
-            }})
-            contents.append({"role": "user", "parts": parts})
-            continue
-
         vertex_role = "model" if role == "assistant" else "user"
         if parts:
             contents.append({"role": vertex_role, "parts": parts})
+
+    # 末尾可能还有未 flush 的 tool parts
+    flush_tool_parts()
 
     req: dict = {"contents": contents}
 
@@ -242,8 +261,10 @@ class Handler(BaseHTTPRequestHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(body)))
+        self.send_header("Connection", "close")
         self.end_headers()
         self.wfile.write(body)
+        self.close_connection = True
 
     def do_GET(self):
         if not self._auth_ok():
@@ -263,12 +284,13 @@ class Handler(BaseHTTPRequestHandler):
         length  = int(self.headers.get("Content-Length", 0))
         body    = json.loads(self.rfile.read(length) or b"{}")
         stream  = body.get("stream", False)
+        model   = body.get("model", MODEL) or MODEL
 
         vertex_body = convert_request(body)
         payload     = json.dumps(vertex_body).encode()
 
         endpoint = "streamGenerateContent" if stream else "generateContent"
-        url = f"{VERTEX_BASE}/{MODEL}:{endpoint}?key={VERTEX_KEY}"
+        url = f"{VERTEX_BASE}/{model}:{endpoint}?key={VERTEX_KEY}"
         if stream:
             url += "&alt=sse"
 
@@ -289,13 +311,9 @@ class Handler(BaseHTTPRequestHandler):
             return
 
         if stream:
-            self.send_response(200)
-            self.send_header("Content-Type", "text/event-stream")
-            self.send_header("Cache-Control", "no-cache")
-            self.send_header("Transfer-Encoding", "chunked")
-            self.end_headers()
-
-            cid = f"chatcmpl-{int(time.time())}"
+            # 先收集所有 chunks，再一次性返回（避免 chunked encoding 兼容性问题）
+            cid    = f"chatcmpl-{int(time.time())}"
+            chunks = []
             for raw_line in resp:
                 line = raw_line.decode("utf-8").strip()
                 if not line.startswith("data:"):
@@ -305,12 +323,19 @@ class Handler(BaseHTTPRequestHandler):
                     continue
                 try:
                     chunk = json.loads(data_str)
-                    sse   = convert_stream_chunk(chunk, cid)
-                    self.wfile.write(sse.encode())
-                    self.wfile.flush()
+                    chunks.append(convert_stream_chunk(chunk, cid).encode())
                 except Exception:
                     pass
-            self.wfile.write(b"data: [DONE]\n\n")
+            chunks.append(b"data: [DONE]\n\n")
+            body_bytes = b"".join(chunks)
+
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Connection", "close")
+            self.send_header("Content-Length", str(len(body_bytes)))
+            self.end_headers()
+            self.wfile.write(body_bytes)
             self.wfile.flush()
         else:
             vertex_resp = json.loads(resp.read())
@@ -325,5 +350,5 @@ if __name__ == "__main__":
     print(f"[proxy] 监听: http://0.0.0.0:{PORT}")
     print(f"[proxy] 模型: {MODEL}")
     print(f"[proxy] 鉴权: {'MASTER_KEY 已设置' if MASTER_KEY else '无限制（建议设置 MASTER_KEY）'}")
-    server = HTTPServer(("0.0.0.0", PORT), Handler)
+    server = ReusableHTTPServer(("0.0.0.0", PORT), Handler)
     server.serve_forever()
